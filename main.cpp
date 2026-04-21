@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <sstream>
 #include <fstream>
+#include <deque>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -151,12 +152,16 @@ int main() {
 
     cout << "\n✅ RAG 시스템 준비 완료! 오프라인 수의사 엔진 가동.\n\n";
 
+    // 슬라이딩 윈도우 (최근 대화 2개를 기억하는 deque)
+    deque<pair<string, string>> chat_history;
+    int max_history = 2;
+
     string user_input;
     while (true) {
         cout << "🐶 증상을 말씀해주세요 (종료: quit): ";
         getline(cin, user_input);
         
-        // 🌟 [안전장치] 윈도우 환경에서 엔터치면 같이 들어가는 보이지 않는 쓰레기값(\r) 완벽 제거
+        // 윈도우 환경에서 엔터치면 같이 들어가는 보이지 않는 쓰레기값(\r)제거
         if (!user_input.empty() && user_input.back() == '\r') {
             user_input.pop_back();
         }
@@ -186,8 +191,17 @@ int main() {
         }
         if (context_str.empty()) context_str = "관련된 수의학 지식이 없습니다. 일반적인 건강 조언을 해주세요.";
 
-        string prompt = "<|im_start|>system\n당신은 대한민국 최고의 반려동물 전문 수의사입니다. 반드시 제공된 [참고 지식]만을 기반으로 답변해야 하며, 지식에 없는 내용은 지어내지 마세요. 질문과 관련 없는 증상(예: 기침 등)은 절대 언급하지 마세요. 답변은 3~4문장의 자연스러운 한국어 구어체로 작성하세요.<|im_end|>\n<|im_start|>user\n[참고 지식]\n" + context_str + "\n[현재 반려견의 증상]\n" + user_input + "\n\n보호자인 저에게 이 증상에 대한 원인과 대처법을 수의사로서 조언해 주세요.<|im_end|>\n<|im_start|>assistant\n";
+        // 멀티턴 프롬프트 생성기
+        string prompt = "<|im_start|>system\n당신은 대한민국 최고의 반려동물 전문 수의사입니다. 제공된 [참고 지식]을 최우선으로 하되, 이전 대화의 문맥을 기억하여 자연스럽게 대답하세요. 단, 보호자가 언급하지 않은 상황(예: 수술, 특정 질병 이력 등)을 참고 지식에서 함부로 가져와서 기정사실화하지 마세요<|im_end|>\n";
 
+        // 과거의 기억을 프롬프트에 주입
+        for (const auto& chat : chat_history) {
+            prompt += "<|im_start|>user\n" + chat.first + "<|im_end|>\n";
+            prompt += "<|im_start|>assistant\n" + chat.second + "<|im_end|>\n";
+        }
+
+        // 현재 질문과 RAG 지식을 마지막에 덧붙임
+        prompt += "<|im_start|>user\n[참고 지식]\n" + context_str + "\n[현재 반려견의 증상/질문]\n" + user_input + "\n\n위 지식을 바탕으로 조언해 주세요.<|im_end|>\n<|im_start|>assistant\n";
         cout << "\n[🧠 대화형 AI의 종합 분석 및 답변 생성 중...]\n\n";
 
         vector<llama_token> tokens(prompt.length() + 100);
@@ -203,7 +217,15 @@ int main() {
         if (llama_decode(chat_ctx, batch)) continue;
 
         llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-        llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(64, 1.1f, 0.0f, 0.0f));
+        
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));      
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));  
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.4f));
+
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+
+        string full_ai_response = "";
 
         for (int i = 0; i < 512; i++) {
             llama_token id = llama_sampler_sample(smpl, chat_ctx, -1);
@@ -215,12 +237,20 @@ int main() {
             int n = llama_token_to_piece(chat_vocab, id, buf, sizeof(buf), 0, true);
             string piece(buf, n);
             cout << piece; 
+            full_ai_response += piece;
             fflush(stdout);
 
             llama_batch b = llama_batch_get_one(&id, 1);
             llama_decode(chat_ctx, b);
         }
         llama_sampler_free(smpl);
+
+        // 대답이 끝나면 deque에 저장하고, 2개가 넘으면 가장 오래된 기억 삭제
+        chat_history.push_back({user_input, full_ai_response});
+        if (chat_history.size() > max_history) {
+            chat_history.pop_front();
+        }
+
         cout << "\n\n------------------------------------------------\n\n";
     }
 
