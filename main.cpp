@@ -12,6 +12,11 @@
 #include "rapidcsv.h"
 #include "llama.h"
 
+//멀티스레딩
+#include <future>
+#include <thread>
+#include <chrono>
+
 using namespace std;
 
 struct PetData {
@@ -216,6 +221,32 @@ int main() {
         llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
         if (llama_decode(chat_ctx, batch)) continue;
 
+        cout << "\n[🧠 AI가 문맥을 파악하고 있습니다] ";
+        
+        // 일꾼 스레드(Background Thread)에게 프롬프트 해석 작업을 지시
+        auto future_decode = std::async(std::launch::async, [&]() {
+            return llama_decode(chat_ctx, batch);
+        });
+
+        // 메인 스레드는 일꾼이 일을 마칠 때까지 쉬지 않고 로딩 애니메이션
+        const char spinner[] = {'|', '/', '-', '\\'};
+        int spin_idx = 0;
+        
+        // 일꾼의 작업(future)이 완료될 때까지 100ms마다 상태를 확인
+        while (future_decode.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
+            cout << "\b" << spinner[spin_idx++ % 4] << flush; // \b는 백스페이스(지우고 다시 그리기)
+        }
+        cout << "\b \b"; // 완료되면 로딩 기호 지우기
+
+        // 일꾼이 반환한 결과값 확인 (에러 처리)
+        if (future_decode.get()) {
+            cerr << "\n❌ 프롬프트 처리 중 에러 발생!\n";
+            continue;
+        }
+
+        cout << "\n[💬 답변 생성 시작]\n\n";
+
+        // 기존 샘플러 세팅 코드 시작 (Repetition Penalty 등...)
         llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
         llama_sampler_chain_add(smpl, llama_sampler_init_penalties(64, 1.1f, 0.0f, 0.0f));
         
