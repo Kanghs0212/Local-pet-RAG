@@ -32,7 +32,7 @@
 </div>
 
 <script>
-    async function sendMessage() {
+    function sendMessage() {
         const inputField = document.getElementById('user-input');
         const sendBtn = document.getElementById('send-btn');
         const chatBox = document.getElementById('chat-box');
@@ -40,38 +40,51 @@
         
         if (!text) return;
 
-        // 1. 유저 메시지 화면에 띄우기
+        // 1. 유저 메시지 띄우기 및 버튼 비활성화
         appendMessage(text, 'user-msg');
         inputField.value = '';
         inputField.disabled = true;
         sendBtn.disabled = true;
 
-        // 2. 로딩 메시지 띄우기
-        const loadingId = 'loading-' + Date.now();
-        appendMessage('생각 중입니다...', 'bot-msg', loadingId);
+        // 2. AI가 타이핑할 빈 말풍선 미리 만들기
+        const msgId = 'msg-' + Date.now();
+        appendMessage('', 'bot-msg', msgId);
+        const aiMessageDiv = document.getElementById(msgId);
 
-        try {
-            // 3. C++ AI 서버로 요청 보내기 (우리가 만든 API!)
-            const response = await fetch('http://localhost:8080/ask?q=' + encodeURIComponent(text));
-            const data = await response.json();
+        // 3. 🌟 서버와 스트리밍 파이프 연결 (Server-Sent Events)
+        const eventSource = new EventSource('http://localhost:8080/ask?q=' + encodeURIComponent(text));
 
-            // 4. 로딩 지우고 AI 답변 화면에 띄우기
-            document.getElementById(loadingId).remove();
-            if (data.error) {
-                appendMessage("앗, 에러가 발생했어요: " + data.error, 'bot-msg');
-            } else {
-                appendMessage(data.answer, 'bot-msg');
+        // 서버에서 글자 조각이 날아올 때마다 실행됨!
+        eventSource.onmessage = function(event) {
+            // 서버가 "[DONE]" 신호를 보내면 연결 끊기
+            if (event.data === "[DONE]") {
+                eventSource.close();
+                inputField.disabled = false;
+                sendBtn.disabled = false;
+                inputField.focus();
+                return;
             }
-        } catch (err) {
-            document.getElementById(loadingId).remove();
-            appendMessage("서버와 연결할 수 없습니다. C++ 엔진이 켜져 있는지 확인해 주세요!", 'bot-msg');
-        }
 
-        inputField.disabled = false;
-        sendBtn.disabled = false;
-        inputField.focus();
+            try {
+                // 날아온 JSON 전체 문장으로 화면 통째로 덮어씌우기
+                const data = JSON.parse(event.data);
+                aiMessageDiv.innerText = data.text; // 🌟 '+' 기호를 지우고 '=' 만 남겨주세요!
+                chatBox.scrollTop = chatBox.scrollHeight;
+            } catch (e) {
+                console.error("데이터 파싱 에러:", e);
+            }
+        };
+
+        // 통신 중 에러가 발생했을 때
+        eventSource.onerror = function() {
+            eventSource.close();
+            aiMessageDiv.innerText += "\n[서버와의 연결이 끊어졌습니다.]";
+            inputField.disabled = false;
+            sendBtn.disabled = false;
+        };
     }
 
+    // 🌟 이 함수가 꼭 있어야 화면에 말풍선이 그려집니다!
     function appendMessage(text, className, id = '') {
         const chatBox = document.getElementById('chat-box');
         const msgDiv = document.createElement('div');

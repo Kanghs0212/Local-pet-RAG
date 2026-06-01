@@ -7,9 +7,9 @@
 
 ## 🛠️ 기술 스택 (Tech Stack)
 - **Core Language:** C++17 (System Optimization)
-- **Frontend UI:** HTML5, CSS3, Vanilla JavaScript (Fetch API)
+- **Frontend UI:** HTML5, CSS3, Vanilla JavaScript (Fetch API, Server-Sent Events)
 - **Backend & Network:** cpp-httplib (REST API Server), Windows Socket (ws2_32)
-- **AI Inference:** llama.cpp (GGUF Quantization)
+- **AI Inference:** llama.cpp (GGUF Quantization, Vulkan GPU Acceleration)
 - **Models:** Qwen2.5-3B-Instruct (LLM), BGE-M3 (Embedding)
 - **Concurrency:** std::async, std::future, std::mutex (Thread-Safe API)
 - **Data Engineering:** RapidCSV, Custom Vector DB Caching (19,000+ items)
@@ -33,10 +33,16 @@
 ### ✅ 6단계: 멀티스레딩(Asynchronous) 도입
 - **비동기 렌더링:** `std::async`를 도입하여 AI가 연산하는 동안 백그라운드 스레드와 메인 스레드를 분리, 시스템이 멈추는(Freezing) 현상을 방지했습니다.
 
-### ✅ 7단계: C++ RESTful API 서버 및 웹 프론트엔드 구축 (최종)
+### ✅ 7단계: C++ RESTful API 서버 및 웹 프론트엔드 구축
 - **마이크로서비스 아키텍처:** `cpp-httplib`를 활용하여 C++ 엔진 자체를 HTTP 웹 서버(포트 8080)로 변신시키고, JSON 형태로 결과를 반환하는 API(`GET /ask`) 엔드포인트를 구축했습니다.
 - **웹 UI 통합 연동:** 사용자가 브라우저에서 편리하게 접근할 수 있는 채팅 인터페이스(`index.html`)를 제작하고 비동기 Fetch API 및 CORS 설정을 통해 C++ 백엔드와 완벽하게 연동했습니다.
 - **동시성 제어:** 여러 웹 요청이 동시에 들어올 때 AI 메모리가 충돌하지 않도록 `std::mutex`를 활용한 Thread-safe 로직을 적용했습니다.
+
+### ✅ 8단계: 하드웨어 가속(Vulkan GPU) 전면 도입
+- **연산 병목 해소:** MSYS2 환경에 Vulkan 라이브러리(`mingw-w64-vulkan-devel`)를 통합하고 CMake 빌드 옵션(`-DGGML_VULKAN=ON`)을 적용하여, 기존 CPU 전용 추론 대비 텍스트 생성 속도를 비약적으로 향상시켰습니다.
+
+### ✅ 9단계: SSE(Server-Sent Events) 기반 실시간 스트리밍 UX 구현
+- **체감 응답성 극대화:** AI의 모든 연산이 끝날 때까지 5~10초간 대기하던 기존 Blocking API 대신, 청크(Chunk) 단위로 생성되는 토큰을 즉시 브라우저로 쏘아주는 SSE 통신 프로토콜을 도입하여 실제 사람이 타자를 치는 듯한 실시간 UX를 구현했습니다.
 
 ## 🔍 핵심 트러블슈팅 (Technical Challenges)
 
@@ -56,6 +62,17 @@
 - **현상:** 원본 데이터 내의 `\n` 및 `"` 문자가 CSV 열 구조를 파괴하거나, 웹 서버의 JSON 응답 포맷을 망가뜨림.
 - **해결:** 텍스트 소독 함수를 구현하여 초기 로딩 시 데이터 무결성을 확보하고, 웹 API 응답 전송 전 C++ 내부에서 이스케이프 문자(`\"`, `\\n`) 치환 작업을 수행하여 안전한 JSON 페이로드를 구성했습니다.
 
+### 5. 스트리밍 환경의 한글 바이트 쪼개짐(UTF-8 Chunking) 에러 해결
+- **현상:** 실시간 SSE 스트리밍 중, 3바이트로 구성된 한글이 1바이트씩 쪼개져 전송되면서 브라우저 화면에 마름모 물음표()로 깨지거나 글자가 기하급수적으로 중복 출력되는 현상 발생.
+- **해결:** 프론트엔드에서 파편화된 조각을 이어 붙이는(`+=`) 방식 대신, C++ 백엔드에서 생성된 '누적 전체 텍스트'를 매번 전송하고 프론트엔드가 이를 화면에 덮어씌우는(`=`) 렌더링 방식으로 전환하여 멀티바이트 언어의 스트리밍 한계를 극복했습니다.
+
+---
+
+## 🔮 향후 발전 계획 (Future Roadmap)
+
+- **Vision AI (멀티모달) 통합:** LLaVA 또는 Qwen-VL 모델을 도입하여, 보호자가 텍스트뿐만 아니라 "강아지 피부 상태 사진"을 업로드하면 이미지를 분석하여 RAG 지식과 결합한 진단을 내리는 시각 보조 기능을 추가할 예정입니다.
+- **개인화 프로필 DB(SQLite) 구축:** C++ 내장 SQLite 데이터베이스를 연동하여 반려견의 기본 정보(이름, 나이, 견종, 기저질환 등)를 영구 저장하고, 이를 시스템 프롬프트에 자동 주입하는 'User Session RAG'를 통해 더욱 정교한 맞춤형 의료 조언을 제공할 계획입니다.
+
 ---
 
 <br>
@@ -64,17 +81,16 @@
 본 프로젝트는 CMake를 기반으로 빌드됩니다.
 
 ```bash
-# 1. 빌드 디렉토리 생성 및 빌드 수행
+# 1. 빌드 디렉토리 생성 및 빌드 수행 (Vulkan GPU 가속 옵션 활성화)
 mkdir build
 cd build
-cmake .. -G "MinGW Makefiles"
+cmake .. -G "MinGW Makefiles" -DGGML_VULKAN=ON
 cmake --build .
 
 # 2. C++ 백엔드 웹 서버 실행
 cd ..
 ./build/pet_engine.exe
 # (터미널에 "🌐 웹 서버가 포트 8080에서 접속을 기다리고 있습니다..." 출력 확인)
-
 ```
 
 프론트엔드 UI 접속 방법:

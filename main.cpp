@@ -171,112 +171,128 @@ int main() {
     httplib::Server svr;
 
     // 🌟 2. "/ask" 주소로 GET 요청이 들어왔을 때 실행될 로직 정의
+    // 🌟 SSE 스트리밍 전용 API 엔드포인트
     svr.Get("/ask", [&](const httplib::Request& req, httplib::Response& res) {
-        
-        // 브라우저가 한글(UTF-8)을 제대로 인식하도록 헤더 설정
-        res.set_header("Content-Type", "application/json; charset=utf-8");
-        // 어떤 웹사이트(HTML)에서든 이 API를 호출할 수 있게 허락 CORS 허용
         res.set_header("Access-Control-Allow-Origin", "*");
 
-        // URL에 질문(?q=증상)이 없는 경우 에러 반환
-        if (!req.has_param("q")) {
-            res.set_content("{\"error\": \"질문 파라미터 'q'가 없습니다.\"}", "application/json");
-            return;
-        }
-
+        if (!req.has_param("q")) return;
         string user_input = req.get_param_value("q");
         cout << "\n[🌐 웹 요청 수신] 질문: " << user_input << "\n";
 
-        // 🔒 다른 요청이 처리 중이면 대기 (Thread-Safe)
-        std::lock_guard<std::mutex> lock(ai_mutex);
+        // 🌟 핵심: 한 번에 뭉쳐서 보내는 대신, 글자가 생성될 때마다 쏴주는 Chunked Provider 사용!
+        res.set_chunked_content_provider("text/event-stream", 
+            [&, user_input](size_t offset, httplib::DataSink &sink) {
+                
+                if (offset > 0) return true; // 첫 호출에만 전체 루프 실행
 
-        // --- 여기서부터 기존의 AI 임베딩 & 검색 로직 재사용 ---
-        vector<float> query_embd = get_ai_embedding(embd_ctx, embd_model, user_input);
+                std::lock_guard<std::mutex> lock(ai_mutex);
 
-        vector<pair<float, int>> search_results; 
-        for (int i = 0; i < database.size(); i++) {
-            float sim = cosine_similarity(query_embd, database[i].embedding);
-            search_results.push_back({sim, i});
-        }
-        sort(search_results.rbegin(), search_results.rend());
+                // --- 1. RAG 임베딩 및 유사도 검색 ---
+                vector<float> query_embd = get_ai_embedding(embd_ctx, embd_model, user_input);
+                vector<pair<float, int>> search_results; 
+                for (int i = 0; i < database.size(); i++) {
+                    float sim = cosine_similarity(query_embd, database[i].embedding);
+                    search_results.push_back({sim, i});
+                }
+                sort(search_results.rbegin(), search_results.rend());
 
-        string context_str = "";
-        for (int i = 0; i < 2 && i < search_results.size(); i++) {
-            if(search_results[i].first < 0.35f) continue; 
-            context_str += "- " + database[search_results[i].second].answer + "\n";
-        }
-        if (context_str.empty()) context_str = "관련된 수의학 지식이 없습니다. 일반적인 건강 조언을 해주세요.";
+                string context_str = "";
+                for (int i = 0; i < 2 && i < search_results.size(); i++) {
+                    // 🌟 깐깐한 지식 필터: 0.55 미만의 엉뚱한 지식은 가차 없이 버립니다!
+                    if(search_results[i].first < 0.55f) continue; 
+                    context_str += "- " + database[search_results[i].second].answer + "\n";
+                }
 
-        // 멀티턴 프롬프트 생성
-        string prompt = "<|im_start|>system\n당신은 대한민국 최고의 반려동물 전문 수의사입니다. 제공된 [참고 지식]을 최우선으로 하되, 이전 대화의 문맥을 기억하여 자연스럽게 대답하세요.<|im_end|>\n";
-        for (const auto& chat : chat_history) {
-            prompt += "<|im_start|>user\n" + chat.first + "<|im_end|>\n";
-            prompt += "<|im_start|>assistant\n" + chat.second + "<|im_end|>\n";
-        }
-        prompt += "<|im_start|>user\n[참고 지식]\n" + context_str + "\n[현재 반려견의 증상/질문]\n" + user_input + "\n\n위 지식을 바탕으로 조언해 주세요.<|im_end|>\n<|im_start|>assistant\n";
+                // --- 2. 멀티턴 프롬프트 생성 ---
+                string prompt = "<|im_start|>system\n"
+                                "당신은 똑똑하고 친절한 반려동물 AI 수의사입니다.\n"
+                                "- 이전 대화 내용(설사, 털 빠짐 등)을 완벽하게 기억하고 문맥을 이어가세요.\n"
+                                "- 사용자가 과거에 무슨 말을 했는지 물어보면, 당황하지 말고 이전 대화를 바탕으로 정확히 대답해 주세요.\n"
+                                "- 수의학적 조언은 핵심만 간결하게(한국어로) 작성하세요.<|im_end|>\n";
+                
+                // 과거 대화 (태그 없이 깔끔하게)
+                for (const auto& chat : chat_history) {
+                    prompt += "<|im_start|>user\n" + chat.first + "<|im_end|>\n";
+                    prompt += "<|im_start|>assistant\n" + chat.second + "<|im_end|>\n";
+                }
+                
+                // 현재 대화 (태그 없이 깔끔하게)
+                prompt += "<|im_start|>user\n";
+                if (!context_str.empty()) {
+                    prompt += "※ 참고 지식:\n" + context_str + "\n\n";
+                }
+                prompt += user_input + "<|im_end|>\n<|im_start|>assistant\n";
 
-        vector<llama_token> tokens(prompt.length() + 100);
-        int n_tokens = llama_tokenize(chat_vocab, prompt.c_str(), prompt.length(), tokens.data(), tokens.size(), true, true);
-        if (n_tokens < 0) { 
-            tokens.resize(-n_tokens);
-            n_tokens = llama_tokenize(chat_vocab, prompt.c_str(), prompt.length(), tokens.data(), tokens.size(), true, true);
-        }
+                // 디버깅 로그
+                cout << "\n================ [AI 엔진 입력 프롬프트 로그] ================\n";
+                cout << prompt;
+                cout << "==============================================================\n\n";
 
-        llama_memory_seq_rm(llama_get_memory(chat_ctx), -1, -1, -1);
-        llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
-        
-        // (API 응답 속도를 위해 이번에는 비동기 애니메이션 제외, 바로 연산)
-        if (llama_decode(chat_ctx, batch)) {
-            res.set_content("{\"error\": \"AI 연산 실패\"}", "application/json");
-            return;
-        }
+                vector<llama_token> tokens(prompt.length() + 100);
+                int n_tokens = llama_tokenize(chat_vocab, prompt.c_str(), prompt.length(), tokens.data(), tokens.size(), true, true);
+                if (n_tokens < 0) { 
+                    tokens.resize(-n_tokens);
+                    n_tokens = llama_tokenize(chat_vocab, prompt.c_str(), prompt.length(), tokens.data(), tokens.size(), true, true);
+                }
 
-        llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(64, 1.1f, 0.0f, 0.0f));
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
-        llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.4f)); 
-        llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+                llama_memory_seq_rm(llama_get_memory(chat_ctx), -1, -1, -1);
+                llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
+                if (llama_decode(chat_ctx, batch)) {
+                    sink.done(); return false;
+                }
 
-        string full_ai_response = "";
-        for (int i = 0; i < 512; i++) {
-            llama_token id = llama_sampler_sample(smpl, chat_ctx, -1);
-            llama_sampler_accept(smpl, id);
-            if (llama_vocab_is_eog(chat_vocab, id)) break;
+                // 샘플러 세팅
+                llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                llama_sampler_chain_add(smpl, llama_sampler_init_penalties(128, 1.15f, 0.0f, 0.0f));
+                llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));
+                llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
+                llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.4f)); 
+                llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-            char buf[128];
-            int n = llama_token_to_piece(chat_vocab, id, buf, sizeof(buf), 0, true);
-            full_ai_response += string(buf, n);
+                string full_ai_response = "";
+                
+                // --- 3. 🌟 토큰 생성 및 실시간 스트리밍 발사! ---
+                for (int i = 0; i < 512; i++) {
+                    llama_token id = llama_sampler_sample(smpl, chat_ctx, -1);
+                    llama_sampler_accept(smpl, id);
+                    if (llama_vocab_is_eog(chat_vocab, id)) break;
 
-            llama_batch b = llama_batch_get_one(&id, 1);
-            llama_decode(chat_ctx, b);
-        }
-        llama_sampler_free(smpl);
+                    char buf[128];
+                    int n = llama_token_to_piece(chat_vocab, id, buf, sizeof(buf), 0, true);
+                    string piece(buf, n);
+                    full_ai_response += piece;
 
-        // 과거 대화 저장
-        chat_history.push_back({user_input, full_ai_response});
-        if (chat_history.size() > max_history) chat_history.pop_front();
+                    // JSON 포맷이 깨지지 않게 엔터(\n)와 따옴표(") 보호
+                    // 🌟 수정: piece가 아니라 '지금까지 모인 전체 문자열(full_ai_response)'을 보냅니다!
+                    string safe_text = full_ai_response; 
+                    
+                    size_t pos = 0;
+                    while ((pos = safe_text.find("\n", pos)) != string::npos) { safe_text.replace(pos, 1, "\\n"); pos += 2; }
+                    pos = 0;
+                    while ((pos = safe_text.find("\"", pos)) != string::npos) { safe_text.replace(pos, 1, "\\\""); pos += 2; }
 
-        // 🌟 3. JSON으로 응답 포장 시, 텍스트 안의 따옴표나 엔터가 JSON을 망치지 않게 간단히 전처리
-        string safe_response = full_ai_response;
-        // 쌍따옴표 이스케이프 (\")
-        size_t pos = 0;
-        while ((pos = safe_response.find("\"", pos)) != string::npos) {
-             safe_response.replace(pos, 1, "\\\"");
-             pos += 2;
-        }
-        // 엔터(\n) 이스케이프 (\\n)
-        pos = 0;
-        while ((pos = safe_response.find("\n", pos)) != string::npos) {
-             safe_response.replace(pos, 1, "\\n");
-             pos += 2;
-        }
+                    // 전체 텍스트를 JSON으로 발사
+                    string sse_msg = "data: {\"text\": \"" + safe_text + "\"}\n\n";
+                    sink.write(sse_msg.c_str(), sse_msg.length());
 
-        // 브라우저로 JSON 응답 발사!
-        string json_result = "{\"question\": \"" + user_input + "\", \"answer\": \"" + safe_response + "\"}";
-        res.set_content(json_result, "application/json");
+                    llama_batch b = llama_batch_get_one(&id, 1);
+                    llama_decode(chat_ctx, b);
+                }
+                llama_sampler_free(smpl);
 
-        cout << "  => [응답 완료] 전송 길이: " << safe_response.length() << "자\n";
+                // 대화 내역 저장
+                chat_history.push_back({user_input, full_ai_response});
+                if (chat_history.size() > max_history) chat_history.pop_front();
+
+                // 🚀 모든 답변이 끝났음을 브라우저에 알림
+                string done_msg = "data: [DONE]\n\n";
+                sink.write(done_msg.c_str(), done_msg.length());
+                
+                sink.done(); // 통신 종료
+                cout << "  => [스트리밍 완료]\n"; // 🌟 로그가 이렇게 바뀌어야 정상입니다!
+                return true;
+            }
+        );
     });
 
     // 🌟 4. 서버 무한 대기 (포트 8080)
