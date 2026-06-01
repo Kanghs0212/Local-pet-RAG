@@ -18,4 +18,9 @@ add_subdirectory(llama.cpp)
 add_executable(pet_engine main.cpp)
 
 # common을 빼고, llama 라이브러리만 정확하게 연결
-target_link_libraries(pet_engine llama)
+target_link_libraries(pet_engine PRIVATE llama)
+
+# 윈도우 환경일 경우 웹 서버 통신을 위한 소켓 라이브러리(ws2_32)를 연결
+if (WIN32)
+    target_link_libraries(pet_engine PRIVATE ws2_32)
+endif()

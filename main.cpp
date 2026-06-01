@@ -7,6 +7,7 @@
 #include <fstream>
 #include <deque>
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #endif
 #include "rapidcsv.h"
@@ -17,7 +18,12 @@
 #include <thread>
 #include <chrono>
 
+//웹 동시접속
+#include <mutex>
+#include "httplib.h"
+
 using namespace std;
+std::mutex ai_mutex;
 
 struct PetData {
     string category;
@@ -157,23 +163,34 @@ int main() {
 
     cout << "\n✅ RAG 시스템 준비 완료! 오프라인 수의사 엔진 가동.\n\n";
 
-    // 슬라이딩 윈도우 (최근 대화 2개를 기억하는 deque)
+    // 과거 대화 기억장치 (서버가 켜져 있는 동안 유지)
     deque<pair<string, string>> chat_history;
-    int max_history = 2;
+    int max_history = 2; 
 
-    string user_input;
-    while (true) {
-        cout << "🐶 증상을 말씀해주세요 (종료: quit): ";
-        getline(cin, user_input);
+    // 🌟 1. 웹 서버 객체 생성
+    httplib::Server svr;
+
+    // 🌟 2. "/ask" 주소로 GET 요청이 들어왔을 때 실행될 로직 정의
+    svr.Get("/ask", [&](const httplib::Request& req, httplib::Response& res) {
         
-        // 윈도우 환경에서 엔터치면 같이 들어가는 보이지 않는 쓰레기값(\r)제거
-        if (!user_input.empty() && user_input.back() == '\r') {
-            user_input.pop_back();
+        // 브라우저가 한글(UTF-8)을 제대로 인식하도록 헤더 설정
+        res.set_header("Content-Type", "application/json; charset=utf-8");
+        // 어떤 웹사이트(HTML)에서든 이 API를 호출할 수 있게 허락 CORS 허용
+        res.set_header("Access-Control-Allow-Origin", "*");
+
+        // URL에 질문(?q=증상)이 없는 경우 에러 반환
+        if (!req.has_param("q")) {
+            res.set_content("{\"error\": \"질문 파라미터 'q'가 없습니다.\"}", "application/json");
+            return;
         }
-        
-        if (user_input == "quit") break;
-        if (user_input.empty()) continue;
 
+        string user_input = req.get_param_value("q");
+        cout << "\n[🌐 웹 요청 수신] 질문: " << user_input << "\n";
+
+        // 🔒 다른 요청이 처리 중이면 대기 (Thread-Safe)
+        std::lock_guard<std::mutex> lock(ai_mutex);
+
+        // --- 여기서부터 기존의 AI 임베딩 & 검색 로직 재사용 ---
         vector<float> query_embd = get_ai_embedding(embd_ctx, embd_model, user_input);
 
         vector<pair<float, int>> search_results; 
@@ -184,30 +201,19 @@ int main() {
         sort(search_results.rbegin(), search_results.rend());
 
         string context_str = "";
-        cout << "\n[🔍 AI가 분석한 유사도 Top 2 문서]\n";
         for (int i = 0; i < 2 && i < search_results.size(); i++) {
-            int idx = search_results[i].second;
-            float sim_score = search_results[i].first;
-            
-            if(sim_score < 0.35f) continue; 
-            
-            context_str += "- " + database[idx].answer + "\n";
-            cout << i+1 << ". (유사도 점수: " << sim_score << ") [" << database[idx].category << "]\n";
+            if(search_results[i].first < 0.35f) continue; 
+            context_str += "- " + database[search_results[i].second].answer + "\n";
         }
         if (context_str.empty()) context_str = "관련된 수의학 지식이 없습니다. 일반적인 건강 조언을 해주세요.";
 
-        // 멀티턴 프롬프트 생성기
-        string prompt = "<|im_start|>system\n당신은 대한민국 최고의 반려동물 전문 수의사입니다. 제공된 [참고 지식]을 최우선으로 하되, 이전 대화의 문맥을 기억하여 자연스럽게 대답하세요. 단, 보호자가 언급하지 않은 상황(예: 수술, 특정 질병 이력 등)을 참고 지식에서 함부로 가져와서 기정사실화하지 마세요<|im_end|>\n";
-
-        // 과거의 기억을 프롬프트에 주입
+        // 멀티턴 프롬프트 생성
+        string prompt = "<|im_start|>system\n당신은 대한민국 최고의 반려동물 전문 수의사입니다. 제공된 [참고 지식]을 최우선으로 하되, 이전 대화의 문맥을 기억하여 자연스럽게 대답하세요.<|im_end|>\n";
         for (const auto& chat : chat_history) {
             prompt += "<|im_start|>user\n" + chat.first + "<|im_end|>\n";
             prompt += "<|im_start|>assistant\n" + chat.second + "<|im_end|>\n";
         }
-
-        // 현재 질문과 RAG 지식을 마지막에 덧붙임
         prompt += "<|im_start|>user\n[참고 지식]\n" + context_str + "\n[현재 반려견의 증상/질문]\n" + user_input + "\n\n위 지식을 바탕으로 조언해 주세요.<|im_end|>\n<|im_start|>assistant\n";
-        cout << "\n[🧠 대화형 AI의 종합 분석 및 답변 생성 중...]\n\n";
 
         vector<llama_token> tokens(prompt.length() + 100);
         int n_tokens = llama_tokenize(chat_vocab, prompt.c_str(), prompt.length(), tokens.data(), tokens.size(), true, true);
@@ -217,73 +223,66 @@ int main() {
         }
 
         llama_memory_seq_rm(llama_get_memory(chat_ctx), -1, -1, -1);
-        
         llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
-        if (llama_decode(chat_ctx, batch)) continue;
-
-        cout << "\n[🧠 AI가 문맥을 파악하고 있습니다] ";
         
-        // 일꾼 스레드(Background Thread)에게 프롬프트 해석 작업을 지시
-        auto future_decode = std::async(std::launch::async, [&]() {
-            return llama_decode(chat_ctx, batch);
-        });
-
-        // 메인 스레드는 일꾼이 일을 마칠 때까지 쉬지 않고 로딩 애니메이션
-        const char spinner[] = {'|', '/', '-', '\\'};
-        int spin_idx = 0;
-        
-        // 일꾼의 작업(future)이 완료될 때까지 100ms마다 상태를 확인
-        while (future_decode.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
-            cout << "\b" << spinner[spin_idx++ % 4] << flush; // \b는 백스페이스(지우고 다시 그리기)
-        }
-        cout << "\b \b"; // 완료되면 로딩 기호 지우기
-
-        // 일꾼이 반환한 결과값 확인 (에러 처리)
-        if (future_decode.get()) {
-            cerr << "\n❌ 프롬프트 처리 중 에러 발생!\n";
-            continue;
+        // (API 응답 속도를 위해 이번에는 비동기 애니메이션 제외, 바로 연산)
+        if (llama_decode(chat_ctx, batch)) {
+            res.set_content("{\"error\": \"AI 연산 실패\"}", "application/json");
+            return;
         }
 
-        cout << "\n[💬 답변 생성 시작]\n\n";
-
-        // 기존 샘플러 세팅 코드 시작 (Repetition Penalty 등...)
         llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
         llama_sampler_chain_add(smpl, llama_sampler_init_penalties(64, 1.1f, 0.0f, 0.0f));
-        
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));      
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));  
-        llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.4f));
-
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.4f)); 
         llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
         string full_ai_response = "";
-
         for (int i = 0; i < 512; i++) {
             llama_token id = llama_sampler_sample(smpl, chat_ctx, -1);
             llama_sampler_accept(smpl, id);
-            
             if (llama_vocab_is_eog(chat_vocab, id)) break;
 
             char buf[128];
             int n = llama_token_to_piece(chat_vocab, id, buf, sizeof(buf), 0, true);
-            string piece(buf, n);
-            cout << piece; 
-            full_ai_response += piece;
-            fflush(stdout);
+            full_ai_response += string(buf, n);
 
             llama_batch b = llama_batch_get_one(&id, 1);
             llama_decode(chat_ctx, b);
         }
         llama_sampler_free(smpl);
 
-        // 대답이 끝나면 deque에 저장하고, 2개가 넘으면 가장 오래된 기억 삭제
+        // 과거 대화 저장
         chat_history.push_back({user_input, full_ai_response});
-        if (chat_history.size() > max_history) {
-            chat_history.pop_front();
+        if (chat_history.size() > max_history) chat_history.pop_front();
+
+        // 🌟 3. JSON으로 응답 포장 시, 텍스트 안의 따옴표나 엔터가 JSON을 망치지 않게 간단히 전처리
+        string safe_response = full_ai_response;
+        // 쌍따옴표 이스케이프 (\")
+        size_t pos = 0;
+        while ((pos = safe_response.find("\"", pos)) != string::npos) {
+             safe_response.replace(pos, 1, "\\\"");
+             pos += 2;
+        }
+        // 엔터(\n) 이스케이프 (\\n)
+        pos = 0;
+        while ((pos = safe_response.find("\n", pos)) != string::npos) {
+             safe_response.replace(pos, 1, "\\n");
+             pos += 2;
         }
 
-        cout << "\n\n------------------------------------------------\n\n";
-    }
+        // 브라우저로 JSON 응답 발사!
+        string json_result = "{\"question\": \"" + user_input + "\", \"answer\": \"" + safe_response + "\"}";
+        res.set_content(json_result, "application/json");
+
+        cout << "  => [응답 완료] 전송 길이: " << safe_response.length() << "자\n";
+    });
+
+    // 🌟 4. 서버 무한 대기 (포트 8080)
+    cout << "🌐 웹 서버가 포트 8080에서 접속을 기다리고 있습니다...\n";
+    cout << "👉 브라우저를 열고 테스트해보세요: http://localhost:8080/ask?q=설사\n";
+    svr.listen("0.0.0.0", 8080);
 
     llama_free(embd_ctx);
     llama_model_free(embd_model);

@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🐶 AI 수의사 상담소</title>
+    <style>
+        body { font-family: 'Malgun Gothic', sans-serif; background-color: #f4f7f6; margin: 0; display: flex; justify-content: center; align-items: center; height: 100vh; }
+        #chat-container { width: 400px; height: 600px; background: white; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); display: flex; flex-direction: column; overflow: hidden; }
+        #header { background: #4CAF50; color: white; padding: 15px; text-align: center; font-size: 1.2em; font-weight: bold; }
+        #chat-box { flex: 1; padding: 15px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+        .message { padding: 10px 15px; border-radius: 15px; max-width: 80%; line-height: 1.4; font-size: 0.95em; }
+        .user-msg { background: #DCF8C6; align-self: flex-end; border-bottom-right-radius: 0; }
+        .bot-msg { background: #E8E8E8; align-self: flex-start; border-bottom-left-radius: 0; white-space: pre-wrap; }
+        #input-area { display: flex; padding: 10px; border-top: 1px solid #ddd; background: #fff; }
+        #user-input { flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 20px; outline: none; }
+        #send-btn { background: #4CAF50; color: white; border: none; padding: 10px 15px; margin-left: 10px; border-radius: 20px; cursor: pointer; font-weight: bold; }
+        #send-btn:disabled { background: #ccc; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+
+<div id="chat-container">
+    <div id="header">🐶 AI 수의사 상담소</div>
+    <div id="chat-box">
+        <div class="message bot-msg">안녕하세요! 반려견의 증상을 편하게 말씀해 주세요.</div>
+    </div>
+    <div id="input-area">
+        <input type="text" id="user-input" placeholder="예: 강아지가 설사를 해요" onkeypress="if(event.key === 'Enter') sendMessage()">
+        <button id="send-btn" onclick="sendMessage()">전송</button>
+    </div>
+</div>
+
+<script>
+    async function sendMessage() {
+        const inputField = document.getElementById('user-input');
+        const sendBtn = document.getElementById('send-btn');
+        const chatBox = document.getElementById('chat-box');
+        const text = inputField.value.trim();
+        
+        if (!text) return;
+
+        // 1. 유저 메시지 화면에 띄우기
+        appendMessage(text, 'user-msg');
+        inputField.value = '';
+        inputField.disabled = true;
+        sendBtn.disabled = true;
+
+        // 2. 로딩 메시지 띄우기
+        const loadingId = 'loading-' + Date.now();
+        appendMessage('생각 중입니다...', 'bot-msg', loadingId);
+
+        try {
+            // 3. C++ AI 서버로 요청 보내기 (우리가 만든 API!)
+            const response = await fetch('http://localhost:8080/ask?q=' + encodeURIComponent(text));
+            const data = await response.json();
+
+            // 4. 로딩 지우고 AI 답변 화면에 띄우기
+            document.getElementById(loadingId).remove();
+            if (data.error) {
+                appendMessage("앗, 에러가 발생했어요: " + data.error, 'bot-msg');
+            } else {
+                appendMessage(data.answer, 'bot-msg');
+            }
+        } catch (err) {
+            document.getElementById(loadingId).remove();
+            appendMessage("서버와 연결할 수 없습니다. C++ 엔진이 켜져 있는지 확인해 주세요!", 'bot-msg');
+        }
+
+        inputField.disabled = false;
+        sendBtn.disabled = false;
+        inputField.focus();
+    }
+
+    function appendMessage(text, className, id = '') {
+        const chatBox = document.getElementById('chat-box');
+        const msgDiv = document.createElement('div');
+        msgDiv.className = 'message ' + className;
+        msgDiv.innerText = text;
+        if (id) msgDiv.id = id;
+        chatBox.appendChild(msgDiv);
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+</script>
+
+</body>
+</html>
